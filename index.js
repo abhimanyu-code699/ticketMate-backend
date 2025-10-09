@@ -6,6 +6,9 @@ dotenv.config();
 
 const app = express();
 
+//database
+require('./config/db');
+
 app.use(express.json());
 
 app.get('/',async(req,res)=>{
