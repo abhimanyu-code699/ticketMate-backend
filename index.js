@@ -1,6 +1,7 @@
 const express = require('express');
 const dotenv = require('dotenv');
 const cors = require('cors');
+const authRoutes = require('./routes/authRoute');
 
 dotenv.config();
 
@@ -11,6 +12,8 @@ require('./config/db');
 
 app.use(express.json());
 
+//api
+app.use('/api',authRoutes);
 app.get('/',async(req,res)=>{
     res.send('TicketMate-Backend🔥');
 })
