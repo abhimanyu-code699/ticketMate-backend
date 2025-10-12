@@ -34,13 +34,13 @@ exports.registerUser = async(req,res) =>{
 
         const [result] = await connection.query(
             "INSERT INTO users(name,email,password,phone,code,isVerify) VALUES(?,?,?,?,?,?)",
-            [name,email,password,phone,code,0]
+            [name,email,hashedPassword,phone,code,0]
         )
         const userData = {
             id: result.insertId,
             name,
             email,
-            password: hashedPassword,
+            password:hashedPassword,
             code
         };
         const userId = userData.id;
@@ -136,7 +136,7 @@ exports.loginUser = async (req, res) => {
     }
     const cachedData = await redisClient.get(`user:${email}`);
     if (cachedData) {
-      const user = JSON.parse(cachedUser);
+      const user = JSON.parse(cachedData);
       const passwordValid = await bcrypt.compare(password, user.password);
       if (!passwordValid)
         return res.status(401).json({ message: "Invalid password" });
