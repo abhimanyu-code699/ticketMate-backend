@@ -2,9 +2,11 @@ const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 const bcrypt = require('bcryptjs');
 const { registerUserSchema } = require('../validators/validator');
-const { success } = require('zod');
+const { success, email } = require('zod');
 const { sendMail } = require('../utils/sendMail');
 const { generateRandomCode } = require('../utils/generateCode');
+const redisClient = require('../config/redis');
+const { id } = require('zod/locales');
 
 exports.registerUser = async(req,res) =>{
     let connection
@@ -34,7 +36,15 @@ exports.registerUser = async(req,res) =>{
             "INSERT INTO users(name,email,password,phone,code,isVerify) VALUES(?,?,?,?,?,?)",
             [name,email,password,phone,code,0]
         )
-
+        const userData = {
+            id: result.insertId,
+            name,
+            email,
+            password: hashedPassword,
+            code
+        };
+        const userId = userData.id;
+        await redisClient.setEx(`verify:${userId}`, 1800, JSON.stringify(userData)); // 30 mins TTL
         //now send to the email
         await sendMail(
             email,
@@ -65,44 +75,36 @@ exports.verifyAccount = async (req, res) => {
   }
 
   try {
+    const redisData = await redisClient.get(`verify:${userId}`);
+    if (!redisData) {
+        return res.status(400).json({ message: 'Verification code expired, register again' });
+    }
+    const user = JSON.parse(redisData);
+
+    if (user.code.toString() !== code.toString()) {
+        return res.status(400).json({ message: 'Invalid verification code' });
+    }
+    const { password, id, name,email } = user;
+
+    await redisClient.setEx(`user:${email}`,86400,JSON.stringify({id,password,name,email}));
+
     connection = await pool.getConnection();
-
-    const [rows] = await connection.query(
-      "SELECT id, name, email, code, createdAt FROM users WHERE id = ?",
-      [userId]
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-
-    const user = rows[0];
-    const userCreatedAt = new Date(user.createdAt);
-    const expirationTime = 30 * 60 * 1000; 
-
-    // Check expiration
-    if (Date.now() - userCreatedAt.getTime() > expirationTime) {
-        await connection.query("DELETE FROM users WHERE id = ?", [userId]);
-        return res.status(400).json({
-            message: 'Verification code has expired, please register again'
-        });
-    }
-
-    // Check code
-    if (code !== user.code) {
-      return res.status(400).json({ message: 'Entered code is wrong' });
-    }
 
     await connection.query(
       "UPDATE users SET isVerify = 1 WHERE id = ?",
       [userId]
     );
+    connection.release();
+
+    // Remove from verification cache
+    await redisClient.del(`verify:${userId}`);
 
     const payload = {
         id:user.id,
         email:user.email,
         name:user.name
     }
+
     //jwt token
     const token = jwt.sign(
         payload,
@@ -123,52 +125,76 @@ exports.verifyAccount = async (req, res) => {
 };
 
 
-exports.loginUser = async(req,res) =>{
-    let connection
-    const { email,password } = req.body;
-    try {
-        if(!email || !password){
-            return res.status(400).json({
-                message:'email and password is required to login'
-            })
-        }
-        connection = await pool.getConnection();
-        
-        const [row] = await connection.query(
-            "SELECT id,name,email FROM users WHERE email = ?",
-            [email]
-        )
-        if(row.length === 0){
-            return res.status(409).json({
-                message:'user not exists with this email'
-            })
-        }
-        const user = row[0];
-        const hashedPassword = await bcrypt.compare(password,user.password)
-        if(!hashedPassword){
-            return res.status(409).json({
-                message:'Invalid password'
-            })
-        }
-        const payload = {
-            id:user.id,
-            name:user.name,
-            email:user.email
-        };
+exports.loginUser = async (req, res) => {
+  let connection;
+  const { email, password } = req.body;
+  try {
+    if (!email || !password) {
+      return res.status(400).json({
+        message: "email and password is required to login",
+      });
+    }
+    const cachedData = await redisClient.get(`user:${email}`);
+    if (cachedData) {
+      const user = JSON.parse(cachedUser);
+      const passwordValid = await bcrypt.compare(password, user.password);
+      if (!passwordValid)
+        return res.status(401).json({ message: "Invalid password" });
 
-        const token = jwt.sign(
-            payload,
-            process.env.JWT_SECRET,
-            { expiresIn:'24h'}
-        )
-        return res.status(200).json({
-            message:'user logged in successfully',
-            token
-        });
+      await redisClient.expire(`user:${email}`, 86400);
+      const token = jwt.sign(
+        { id: user.id, name: user.name, email: user.email },
+        process.env.JWT_SECRET,
+        { expiresIn: "24h" }
+      );
+      return res
+        .status(200)
+        .json({ message: "User logged in (from cache)", token });
+    }
+    connection = await pool.getConnection();
+    const [rows] = await connection.query(
+      "SELECT id, name, email, password FROM users WHERE email = ? AND isVerify = 1",
+      [email]
+    );
+
+    if (rows.length === 0) {
+      return res
+        .status(404)
+        .json({ message: "User not found or not verified" });
+    }
+    const user = rows[0];
+    const passwordValid = await bcrypt.compare(password, user.password);
+    if (!passwordValid)
+      return res.status(401).json({ message: "Invalid password" });
+
+    // Cache the user in Redis for next login
+    await redisClient.setEx(`user:${email}`, 86400, JSON.stringify(user));
+
+    const payload = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+    };
+
+    const token = jwt.sign(payload, process.env.JWT_SECRET, {
+      expiresIn: "24h",
+    });
+    return res.status(200).json({
+      message: "user logged in successfully",
+      token,
+    });
+  } catch (error) {
+    console.log(error.message);
+    return res.status(500).json(error);
+  } finally {
+    if (connection) connection.release();
+  }
+};
+
+exports.forgetPassword = () =>{
+    try {
+        
     } catch (error) {
-        console.log(error.message);
-        return res.status(500).json(error);
-    }finally{
-        if(connection)connection.release();
+        
     }
 }
