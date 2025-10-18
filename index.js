@@ -9,6 +9,8 @@ dotenv.config();
 
 const app = express();
 
+app.use(cors());
+
 //database
 require('./config/db');
 require('./config/redis');

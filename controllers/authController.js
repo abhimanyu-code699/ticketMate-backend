@@ -37,6 +37,7 @@ exports.registerUser = async(req,res) =>{
             "INSERT INTO users(name,email,password,phone,code,isVerify) VALUES(?,?,?,?,?,?)",
             [name,email,hashedPassword,phone,code,0]
         )
+        console.log("result:",result);
         const userData = {
             id: result.insertId,
             name,
@@ -44,8 +45,7 @@ exports.registerUser = async(req,res) =>{
             password:hashedPassword,
             code
         };
-        const userId = userData.id;
-        await redisClient.setEx(`verify:${userId}`, 1800, JSON.stringify(userData)); // 30 mins TTL
+        await redisClient.setEx(`verify:${email}`, 300, JSON.stringify(userData)); // 5 mins TTL
         //now send to the email
         await sendMail(
             email,
@@ -68,16 +68,22 @@ exports.registerUser = async(req,res) =>{
 exports.verifyAccount = async (req, res) => {
   let connection;
 
-  const { userId, code } = req.body;
-  if (!userId || !code) {
+  const { email, code } = req.body;
+  if (!email || !code) {
     return res.status(400).json({
-      message: 'User Id and verification code are required'
+      message: 'Email Id and verification code are required'
     });
   }
 
   try {
-    const redisData = await redisClient.get(`verify:${userId}`);
+    const redisData = await redisClient.get(`verify:${email}`);
     if (!redisData) {
+        //remove from database also
+        connection = await pool.getConnection();
+        await connection.query(
+          "DELETE FROM users WHERE email = ?",[email]
+        )
+        connection.release();
         return res.status(400).json({ message: 'Verification code expired, register again' });
     }
     const user = JSON.parse(redisData);
@@ -85,9 +91,14 @@ exports.verifyAccount = async (req, res) => {
     if (user.code.toString() !== code.toString()) {
         return res.status(400).json({ message: 'Invalid verification code' });
     }
-    const { password, id, name,email } = user;
 
-    await redisClient.setEx(`user:${email}`,86400,JSON.stringify({id,password,name,email}));
+   //store user on cache
+   await redisClient.hSet(`user:${email}`,{
+    id:user.id,
+    email,
+    password:user.password
+   });
+   await redisClient.expire(`user:${email}`,86400);
 
     connection = await pool.getConnection();
 
