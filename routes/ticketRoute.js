@@ -6,7 +6,8 @@ const {
     uploadTicket, 
     getTicket,
     ticketHistory,
-    updateUploadedTicketStatus
+    updateUploadedTicketStatus,
+    updateGetTicketStatus
 } = require('../controllers/ticketController');
 
 const router = express.Router();
@@ -21,5 +22,6 @@ router.post(
 router.post("/getTicket",verifyToken,getTicket);
 router.get('/ticketHistory',verifyToken,ticketHistory);
 router.put('/update-uploaded-ticket-status',verifyToken,updateUploadedTicketStatus);
+router.put('/update-get-ticket-status',verifyToken,updateGetTicketStatus);
 
 module.exports = router;

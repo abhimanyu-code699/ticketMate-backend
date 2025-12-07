@@ -180,17 +180,17 @@ exports.ticketHistory = async (req, res) => {
     let connection;
 
     try {
-        const userId = req.user.id; // assuming auth middleware sets req.user
+        const userId = req.user.id;
 
         connection = await pool.getConnection();
 
-        // Fetch uploaded tickets
+        // Fetch uploaded tickets with formatted date (string)
         const [uploadedTickets] = await connection.query(
             `SELECT 
                 id,
                 boarding_station,
                 destination_station,
-                departure_date,
+                DATE_FORMAT(departure_date, '%Y-%m-%d') AS departure_date,
                 travel_class,
                 status,
                 'uploaded' AS type
@@ -200,13 +200,13 @@ exports.ticketHistory = async (req, res) => {
             [userId]
         );
 
-        // Fetch get tickets
+        // Fetch get tickets with formatted date
         const [getTickets] = await connection.query(
             `SELECT 
                 id,
                 boarding_station,
                 destination_station,
-                departure_date,
+                DATE_FORMAT(departure_date, '%Y-%m-%d') AS departure_date,
                 travel_class,
                 status,
                 'get_ticket' AS type
@@ -216,7 +216,7 @@ exports.ticketHistory = async (req, res) => {
             [userId]
         );
 
-        // Merge both arrays
+        // Merge arrays
         const history = [...uploadedTickets, ...getTickets];
 
         res.status(200).json({ history });
@@ -229,27 +229,32 @@ exports.ticketHistory = async (req, res) => {
     }
 };
 
+
 exports.updateUploadedTicketStatus = async (req, res) => {
     let connection;
     try {
-        const id = req.user.id;
-        const { boarding_station, destination_station, departure_date, travel_class } = req.body;
+        const loggedInUserId = req.user.id; // logged-in user ID
+        const { ticket_id, boarding_station, destination_station, departure_date, travel_class } = req.body;
 
-        if (!boarding_station || !destination_station || !departure_date || !travel_class) {
+        if (!ticket_id || !boarding_station || !destination_station || !departure_date || !travel_class) {
             return res.status(400).json({ message: "All fields are required" });
         }
 
+        console.log("ticketid",ticket_id);
+        // Convert "2025-12-08T18:30:00.000Z" → "2025-12-08"
+        const date = departure_date.split("T")[0];
+
         connection = await pool.getConnection();
 
-        // Check if ticket exists in get_ticket table
+        // ---- 1️⃣ Find matching ticket in get_ticket ----
         const [rows] = await connection.query(
-            `SELECT id, boarding_station, destination_station, departure_date, travel_class, status 
+            `SELECT id, userId, boarding_station, destination_station, departure_date, travel_class, status 
              FROM get_ticket
              WHERE boarding_station = ? 
                AND destination_station = ? 
                AND departure_date = ? 
                AND travel_class = ?`,
-            [boarding_station, destination_station, departure_date, travel_class]
+            [boarding_station, destination_station, date, travel_class]
         );
 
         if (rows.length === 0) {
@@ -258,18 +263,136 @@ exports.updateUploadedTicketStatus = async (req, res) => {
 
         const ticket = rows[0];
 
-        // Update status to 'found' if not already
+        const [user] = await connection.query(
+            `SELECT name, phone FROM users WHERE id = ?`,
+            [ticket.userId]
+        );
+
+        const userDetails = user.length > 0 ? user[0] : null;
+
+        // ---- 3️⃣ Update status in both tables if not already 'found' ----
         if (ticket.status !== "found") {
+            // Update get_ticket
             await connection.query(
-                `UPDATE get_ticket SET status = ? WHERE id = ?`,
-                ["found", ticket.id]
+                `UPDATE get_ticket SET status = 'found' WHERE id = ?`,
+                [ticket.id]
             );
-            ticket.status = "found"; // update local object
+
+            // Update uploaded_ticket using ticket_id from frontend
+            await connection.query(
+                `UPDATE uploaded_ticket SET status = 'found' WHERE id = ?`,
+                [ticket_id]
+            );
+
+            // Update local object for response
+            ticket.status = "found";
         }
+
+        // ---- 4️⃣ Fetch updated get_ticket for response ----
+        const [updatedTicketRows] = await connection.query(
+            `SELECT * FROM get_ticket WHERE id = ?`,
+            [ticket.id]
+        );
+
+        const updatedTicket = updatedTicketRows[0];
 
         return res.status(200).json({
             message: "Ticket status updated successfully",
-            ticket
+            ticket: updatedTicket,
+            user: userDetails
+        });
+
+    } catch (error) {
+        console.error("Update Uploaded Ticket Status Error:", error);
+        return res.status(500).json({ message: "Internal Server Error" });
+    } finally {
+        if (connection) connection.release();
+    }
+};
+
+exports.updateGetTicketStatus = async (req, res) => {
+    let connection;
+
+    try {
+        const { ticket_id, boarding_station, destination_station, departure_date, travel_class } = req.body;
+
+        // Validate fields
+        if (!boarding_station || !destination_station || !departure_date || !travel_class) {
+            return res.status(400).json({ message: "All fields are required" });
+        }
+
+        // Convert timestamp "2025-12-08T18:30:00.000Z" → "2025-12-08"
+        const date = departure_date.split("T")[0];
+
+        connection = await pool.getConnection();
+
+        // 1️⃣ FIND MATCHING uploaded_ticket
+        const [uploadedRows] = await connection.query(
+            `SELECT 
+                ut.id,
+                ut.uploaded_by,
+                ut.boarding_station,
+                ut.destination_station,
+                ut.departure_date,
+                ut.travel_class,
+                ut.status,
+                u.name,
+                u.phone
+            FROM uploaded_ticket ut
+            JOIN users u ON ut.uploaded_by = u.id
+            WHERE 
+                ut.boarding_station = ?
+                AND ut.destination_station = ?
+                AND ut.departure_date = ?
+                AND ut.travel_class = ?`,
+            [boarding_station, destination_station, date, travel_class]
+        );
+
+        if (uploadedRows.length === 0) {
+            return res.status(404).json({ message: "Matching Uploaded Ticket Not Found" });
+        }
+
+        const uploadedTicket = uploadedRows[0];
+
+        // 2️⃣ UPDATE uploaded_ticket STATUS → completed
+        if (uploadedTicket.status !== "completed") {
+            await connection.query(
+                `UPDATE uploaded_ticket 
+                 SET status = 'completed' 
+                 WHERE id = ?`,
+                [uploadedTicket.id]
+            );
+        }
+
+        // 3️⃣ UPDATE get_ticket STATUS → found/completed
+        // (ticket_id is passed from frontend)
+        await connection.query(
+            `UPDATE get_ticket 
+             SET status = 'found' 
+             WHERE id = ?`,
+            [ticket_id]
+        );
+
+        // 4️⃣ FETCH UPDATED TICKET FOR RESPONSE
+        const [updatedUploaded] = await connection.query(
+            `SELECT 
+                ut.id,
+                ut.boarding_station,
+                ut.destination_station,
+                ut.departure_date,
+                ut.travel_class,
+                ut.status,
+                u.name,
+                u.phone
+             FROM uploaded_ticket ut
+             JOIN users u ON ut.uploaded_by = u.id
+             WHERE ut.id = ?`,
+            [uploadedTicket.id]
+        );
+
+        return res.status(200).json({
+            message: "Ticket status updated in both tables successfully",
+            ticket: updatedUploaded[0]
         });
 
     } catch (error) {
@@ -280,63 +403,4 @@ exports.updateUploadedTicketStatus = async (req, res) => {
     }
 };
 
-exports.updateUploadedTicketStatus = async (req, res) => {
-    let connection;
-    try {
-        const { boarding_station, destination_station, departure_date, travel_class } = req.body;
 
-        if (!boarding_station || !destination_station || !departure_date || !travel_class) {
-            return res.status(400).json({ message: "All fields are required" });
-        }
-
-        connection = await pool.getConnection();
-
-        // Check if ticket exists in uploaded_ticket table
-        const [rows] = await connection.query(
-            `SELECT t.id, t.boarding_station, t.destination_station, t.departure_date, t.travel_class, t.status, u.name, u.phone_number
-             FROM uploaded_ticket t
-             JOIN users u ON t.uploaded_by = u.id
-             WHERE t.boarding_station = ? 
-               AND t.destination_station = ? 
-               AND t.departure_date = ? 
-               AND t.travel_class = ?`,
-            [boarding_station, destination_station, departure_date, travel_class]
-        );
-
-        if (rows.length === 0) {
-            return res.status(404).json({ message: "Uploaded ticket not found" });
-        }
-
-        const ticket = rows[0];
-
-        // Update status to 'found' if not already
-        if (ticket.status !== "found") {
-            await connection.query(
-                `UPDATE uploaded_ticket SET status = ? WHERE id = ?`,
-                ["found", ticket.id]
-            );
-            ticket.status = "found"; // update local object
-        }
-
-        // Return ticket info along with user details
-        return res.status(200).json({
-            message: "Uploaded ticket found and status updated",
-            ticket: {
-                id: ticket.id,
-                boarding_station: ticket.boarding_station,
-                destination_station: ticket.destination_station,
-                departure_date: ticket.departure_date,
-                travel_class: ticket.travel_class,
-                status: ticket.status,
-                user_name: ticket.name,
-                user_phone: ticket.phone_number
-            }
-        });
-
-    } catch (error) {
-        console.error("Update Uploaded Ticket Status Error:", error);
-        return res.status(500).json({ message: "Internal Server Error" });
-    } finally {
-        if (connection) connection.release();
-    }
-};
