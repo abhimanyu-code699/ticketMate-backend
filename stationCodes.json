@@ -1,0 +1,8 @@
+[
+  { "stationCode": "BAM", "stationName": "Brahmapur", "state": "Odisha" },
+  { "stationCode": "NDLS", "stationName": "New Delhi", "state": "Delhi" },
+  { "stationCode": "BPL", "stationName": "Bhopal", "state": "Madhya Pradesh" },
+  { "stationCode": "MAS", "stationName": "Chennai Central", "state": "Tamil Nadu" },
+  { "stationCode": "HWH", "stationName": "Howrah", "state": "West Bengal" },
+  { "stationCode": "SBC", "stationName": "Bangalore City", "state": "Karnataka" }
+]

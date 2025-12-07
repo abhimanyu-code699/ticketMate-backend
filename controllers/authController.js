@@ -7,6 +7,7 @@ const { sendMail } = require('../utils/sendMail');
 const { generateRandomCode } = require('../utils/generateCode');
 const redisClient = require('../config/redis');
 const { default: RedisStore } = require('rate-limit-redis');
+const { asyncWrapProviders } = require('async_hooks');
 
 
 exports.registerUser = async(req,res) =>{
@@ -15,7 +16,7 @@ exports.registerUser = async(req,res) =>{
     const validatedData = registerUserSchema.parse(req.body);
 
     try {
-        const { name,email,password,phone } = validatedData;
+        const { fullName,email,password,phone } = validatedData;
         
         connection = await pool.getConnection();
 
@@ -35,17 +36,16 @@ exports.registerUser = async(req,res) =>{
 
         const [result] = await connection.query(
             "INSERT INTO users(name,email,password,phone,code,isVerify) VALUES(?,?,?,?,?,?)",
-            [name,email,hashedPassword,phone,code,0]
+            [fullName,email,hashedPassword,phone,code,0]
         )
         console.log("result:",result);
         const userData = {
             id: result.insertId,
-            name,
+            fullName,
             email,
             password:hashedPassword,
             code
         };
-        await redisClient.setEx(`verify:${email}`, 300, JSON.stringify(userData)); // 5 mins TTL
         //now send to the email
         await sendMail(
             email,
@@ -55,7 +55,7 @@ exports.registerUser = async(req,res) =>{
         );
         return res.status(200).json({
             success:true,
-            message:'user register and verification code sended successfully',
+            message:'user register and verification code sended successfully.Please Check youe email',
             userId:result.insertId
         });
     } catch (error) {
@@ -69,139 +69,153 @@ exports.verifyAccount = async (req, res) => {
   let connection;
 
   const { email, code } = req.body;
+
   if (!email || !code) {
     return res.status(400).json({
-      message: 'Email Id and verification code are required'
+      message: "Email Id and verification code are required"
     });
   }
 
   try {
-    const redisData = await redisClient.get(`verify:${email}`);
-    if (!redisData) {
-        //remove from database also
-        connection = await pool.getConnection();
-        await connection.query(
-          "DELETE FROM users WHERE email = ?",[email]
-        )
-        connection.release();
-        return res.status(400).json({ message: 'Verification code expired, register again' });
-    }
-    const user = JSON.parse(redisData);
-
-    if (user.code.toString() !== code.toString()) {
-        return res.status(400).json({ message: 'Invalid verification code' });
-    }
-
-   //store user on cache
-   await redisClient.hSet(`user:${email}`,{
-    id:user.id,
-    email,
-    password:user.password
-   });
-   await redisClient.expire(`user:${email}`,86400);
-
     connection = await pool.getConnection();
 
-    await connection.query(
-      "UPDATE users SET isVerify = 1 WHERE id = ?",
-      [userId]
+    // 1️⃣ Find user using email
+    const [rows] = await connection.query(
+      "SELECT id, email, code, isVerify, createdAt FROM users WHERE email = ?",
+      [email]
     );
-    connection.release();
 
-    // Remove from verification cache
-    await redisClient.del(`verify:${userId}`);
-
-    const payload = {
-        id:user.id,
-        email:user.email,
-        name:user.name
+    if (rows.length === 0) {
+      connection.release();
+      return res.status(400).json({ message: "User not found, register again" });
     }
 
-    //jwt token
-    const token = jwt.sign(
-        payload,
-        process.env.JWT_SECRET,
-        { expiresIn:'24h'}
-    )
+    const user = rows[0];
+
+    // 2️⃣ Check if already verified
+    if (user.isVerify === 1) {
+      connection.release();
+      return res.status(400).json({ message: "Account already verified" });
+    }
+
+    // 3️⃣ Check expiration (10 minutes)
+    const createdTime = new Date(user.createdAt).getTime();
+    const now = Date.now();
+    const diffMinutes = (now - createdTime) / (1000 * 60);
+
+    if (diffMinutes > 10) {
+      // Delete user because code expired
+      await connection.query("DELETE FROM users WHERE email = ?", [email]);
+      connection.release();
+
+      return res.status(400).json({
+        message: "Verification code expired, register again"
+      });
+    }
+
+    // 4️⃣ Compare codes
+    if (user.code.toString() !== code.toString()) {
+      connection.release();
+      return res.status(400).json({
+        message: "Invalid verification code"
+      });
+    }
+
+    // 5️⃣ Mark verified
+    await connection.query(
+      "UPDATE users SET isVerify = 1 WHERE id = ?",
+      [user.id]
+    );
+
+    // 6️⃣ Generate JWT token
+    const payload = {
+      id: user.id,
+      email: user.email
+    };
+
+    const token = jwt.sign(payload, process.env.JWT_SECRET, {
+      expiresIn: "24h"
+    });
+
+    connection.release();
+
     return res.status(200).json({
       success: true,
-      message: 'Account verified successfully',
+      message: "Account verified successfully",
       token
     });
+
   } catch (error) {
-    console.log(error.message);
-    return res.status(500).json({ message: 'Server error', error: error.message });
+    console.log("Verify Error:", error.message);
+
+    return res.status(500).json({
+      message: "Server error",
+      error: error.message
+    });
+
   } finally {
     if (connection) connection.release();
   }
 };
+
 
 
 exports.loginUser = async (req, res) => {
   let connection;
   const { email, password } = req.body;
+
   try {
     if (!email || !password) {
       return res.status(400).json({
-        message: "email and password is required to login",
+        message: "Email and password are required",
       });
     }
-    const cachedData = await redisClient.get(`user:${email}`);
-    if (cachedData) {
-      const user = JSON.parse(cachedData);
-      const passwordValid = await bcrypt.compare(password, user.password);
-      if (!passwordValid)
-        return res.status(401).json({ message: "Invalid password" });
 
-      await redisClient.expire(`user:${email}`, 86400);
-      const token = jwt.sign(
-        { id: user.id, name: user.name, email: user.email },
-        process.env.JWT_SECRET,
-        { expiresIn: "24h" }
-      );
-      return res
-        .status(200)
-        .json({ message: "User logged in (from cache)", token });
-    }
     connection = await pool.getConnection();
-    const [rows] = await connection.query(
-      "SELECT id, name, email, password FROM users WHERE email = ? AND isVerify = 1",
+
+    // Fetch full user data
+    const [result] = await connection.query(
+      "SELECT id, name, email, password FROM users WHERE email = ?",
       [email]
     );
 
-    if (rows.length === 0) {
-      return res
-        .status(404)
-        .json({ message: "User not found or not verified" });
+    if (result.length === 0) {
+      return res.status(404).json({
+        message: "User not found",
+      });
     }
-    const user = rows[0];
-    const passwordValid = await bcrypt.compare(password, user.password);
-    if (!passwordValid)
-      return res.status(401).json({ message: "Invalid password" });
 
-    // Cache the user in Redis for next login
-    await redisClient.setEx(`user:${email}`, 86400, JSON.stringify(user));
+    const user = result[0];
 
-    const payload = {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-    };
+    // Compare password
+    const matchedPassword = await bcrypt.compare(password, user.password);
 
-    const token = jwt.sign(payload, process.env.JWT_SECRET, {
-      expiresIn: "24h",
-    });
+    if (!matchedPassword) {
+      return res.status(401).json({
+        message: "Invalid password",
+      });
+    }
+
+    // Generate Token
+    const token = jwt.sign(
+      { id: user.id, name: user.name, email: user.email },
+      process.env.JWT_SECRET,
+      { expiresIn: "24h" }
+    );
+
     return res.status(200).json({
-      message: "user logged in successfully",
+      message: "User logged in successfully",
       token,
     });
+
   } catch (error) {
     console.log(error.message);
-    return res.status(500).json(error);
+    return res.status(500).json({ message: "Server error", error: error.message });
   } finally {
     if (connection) connection.release();
   }
 };
+
 
 exports.forgetPassword = async(req,res) =>{
   let connection;

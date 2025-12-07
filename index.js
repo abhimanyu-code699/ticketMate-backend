@@ -4,6 +4,8 @@ const cors = require('cors');
 const authRoutes = require('./routes/authRoute');
 const ticketRoutes = require('./routes/ticketRoute');
 const redisClient = require('./config/redis');
+const uploadDocuments = require('./routes/documentUpload');
+const stationCode = require('./routes/stationCodes');
 
 dotenv.config();
 
@@ -13,12 +15,14 @@ app.use(cors());
 
 //database
 require('./config/db');
-require('./config/redis');
+
 app.use(express.json());
 
 //api
 app.use('/api',authRoutes);
 app.use('/api',ticketRoutes);
+app.use('/api',uploadDocuments);
+app.use('/api',stationCode);
 
 app.get('/',async(req,res)=>{
     res.send('TicketMate-Backend🔥');
